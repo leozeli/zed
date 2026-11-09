@@ -4654,6 +4654,65 @@ impl AgentPanel {
         .conversation_view
     }
 
+    /// Rebuilds a center-pane thread from its persisted thread id.
+    ///
+    /// Unlike [`Self::load_agent_thread`] this never installs the view as the
+    /// panel's base view; the caller owns it.
+    pub(crate) fn resume_center_thread(
+        &mut self,
+        agent: Agent,
+        thread_id: ThreadId,
+        work_dirs: Option<PathList>,
+        title: Option<SharedString>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<ConversationView> {
+        if let Some(store) = ThreadMetadataStore::try_global(cx) {
+            store.update(cx, |store, cx| {
+                store.unarchive(thread_id, cx);
+            });
+        }
+
+        self.create_agent_thread_with_server(
+            agent,
+            None,
+            Some(thread_id),
+            work_dirs,
+            title,
+            None,
+            None,
+            AgentThreadSource::CenterPane,
+            window,
+            cx,
+        )
+        .conversation_view
+    }
+
+    /// Waits for this workspace's `AgentPanel` to be installed in a dock.
+    ///
+    /// Panels are loaded concurrently with the center pane during workspace
+    /// restore, so an item that needs the panel has to wait for it. Returns an
+    /// error if the workspace goes away first.
+    pub(crate) fn wait_for_panel(
+        workspace: &WeakEntity<Workspace>,
+        cx: &mut gpui::AsyncWindowContext,
+    ) -> Task<Result<Entity<Self>>> {
+        let workspace = workspace.clone();
+        cx.spawn(async move |cx| {
+            loop {
+                let panel = workspace
+                    .read_with(cx, |workspace, cx| workspace.panel::<Self>(cx))
+                    .map_err(|error| anyhow::anyhow!("{error}"))?;
+                if let Some(panel) = panel {
+                    return Ok(panel);
+                }
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(20))
+                    .await;
+            }
+        })
+    }
+
     /// Legacy entry that resumes a thread by raw ACP session id when no
     /// local [`ThreadMetadata`] row exists yet (share-link imports and
     /// clipboard imports).

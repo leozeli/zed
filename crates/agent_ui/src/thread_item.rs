@@ -5,41 +5,53 @@
 //! it in a minimal `Item` implementation so a thread can also be opened as a
 //! regular tab in the center pane, next to editors and terminals.
 //!
-//! Scope notes:
-//! - The thread is still created through [`AgentPanel`], so it keeps its thread
-//!   metadata, sidebar entry, and notification behavior.
-//! - Serialization is intentionally not implemented. A center thread does not
-//!   survive a workspace restore yet; reopening is a manual action.
+//! The thread itself is still created through [`AgentPanel`], so it keeps its
+//! thread metadata, sidebar entry, and notification behavior. What this module
+//! adds is the mapping from a workspace item id to a thread id, which is all
+//! that is needed to restore the tab on the next launch.
 
-use crate::{Agent, AgentPanel, ConversationView, NewCenterThread};
+use crate::{
+    Agent, AgentPanel, ConversationView, NewCenterThread,
+    thread_metadata_store::{ThreadId, ThreadMetadataStore},
+};
+use anyhow::Result;
+use db::{
+    query,
+    sqlez::{domain::Domain, statement::Statement, thread_safe_connection::ThreadSafeConnection},
+    sqlez_macros::sql,
+};
 use gpui::{
     App, Context, Entity, EventEmitter, FocusHandle, Focusable, IntoElement, Render, SharedString,
-    Window, prelude::*,
+    Task, WeakEntity, Window, prelude::*,
 };
-use project::DisableAiSettings;
+use project::{DisableAiSettings, Project};
 use settings::Settings as _;
 use theme_settings::ThemeSettings;
-use ui::{
-    Icon, IconName, Tooltip,
-    prelude::*,
-    utils::WithRemSize,
-};
+use ui::{Icon, IconName, Tooltip, prelude::*, utils::WithRemSize};
 use workspace::{
-    Item, Workspace,
+    Item, SerializableItem, Workspace, WorkspaceId, delete_unloaded_items,
     item::{ItemEvent, TabTooltipContent},
 };
 
 /// A workspace item that hosts an agent conversation in a center pane.
 pub struct ThreadItem {
     conversation_view: Entity<ConversationView>,
+    workspace_id: Option<WorkspaceId>,
     focus_handle: FocusHandle,
+    needs_serialize: bool,
 }
 
 impl ThreadItem {
-    pub fn new(conversation_view: Entity<ConversationView>, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        conversation_view: Entity<ConversationView>,
+        workspace_id: Option<WorkspaceId>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         Self {
             conversation_view,
+            workspace_id,
             focus_handle: cx.focus_handle(),
+            needs_serialize: true,
         }
     }
 
@@ -65,7 +77,8 @@ impl ThreadItem {
         let conversation_view =
             panel.update(cx, |panel, cx| panel.create_center_thread(agent, window, cx));
 
-        let item = cx.new(|cx| Self::new(conversation_view, cx));
+        let workspace_id = workspace.database_id();
+        let item = cx.new(|cx| Self::new(conversation_view, workspace_id, cx));
         workspace.add_item_to_active_pane(Box::new(item), None, true, window, cx);
     }
 }
@@ -152,5 +165,143 @@ impl Item for ThreadItem {
 
     fn to_item_events(event: &Self::Event, f: &mut dyn FnMut(ItemEvent)) {
         f(*event);
+    }
+}
+
+impl SerializableItem for ThreadItem {
+    fn serialized_item_kind() -> &'static str {
+        "AgentThread"
+    }
+
+    fn cleanup(
+        workspace_id: WorkspaceId,
+        alive_items: Vec<workspace::ItemId>,
+        _window: &mut Window,
+        cx: &mut App,
+    ) -> Task<Result<()>> {
+        let db = CenterThreadDb::global(cx);
+        delete_unloaded_items(alive_items, workspace_id, "center_agent_threads", &db, cx)
+    }
+
+    fn serialize(
+        &mut self,
+        _workspace: &mut Workspace,
+        item_id: workspace::ItemId,
+        _closing: bool,
+        cx: &mut Context<Self>,
+    ) -> Option<Task<Result<()>>> {
+        if !self.needs_serialize {
+            return None;
+        }
+        let workspace_id = self.workspace_id?;
+        let thread_id = self.conversation_view.read(cx).thread_id;
+        self.needs_serialize = false;
+
+        let db = CenterThreadDb::global(cx);
+        Some(cx.background_spawn(async move {
+            db.save_thread_id(item_id, workspace_id, thread_id).await
+        }))
+    }
+
+    fn should_serialize(&self, _: &Self::Event) -> bool {
+        self.needs_serialize
+    }
+
+    fn deserialize(
+        _project: Entity<Project>,
+        workspace: WeakEntity<Workspace>,
+        workspace_id: WorkspaceId,
+        item_id: workspace::ItemId,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Task<Result<Entity<Self>>> {
+        let db = CenterThreadDb::global(cx);
+        window.spawn(cx, async move |cx| {
+            let thread_id = db
+                .thread_id(item_id, workspace_id)?
+                .into_iter()
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("missing center agent thread row"))?;
+
+            let metadata = cx.update(|_, cx| {
+                ThreadMetadataStore::try_global(cx)
+                    .and_then(|store| store.read(cx).entry(thread_id).cloned())
+            })?;
+            let metadata = metadata
+                .ok_or_else(|| anyhow::anyhow!("thread {thread_id:?} is no longer in the store"))?;
+            let agent = Agent::from(metadata.agent_id.clone());
+            let work_dirs = metadata.folder_paths().clone();
+            let title = metadata.title();
+
+            // The Agent Panel may not exist yet: panels are loaded concurrently
+            // with the center pane during workspace restore. Wait for it rather
+            // than silently dropping the tab.
+            let panel = AgentPanel::wait_for_panel(&workspace, &mut *cx).await?;
+
+            cx.update(|window, cx| {
+                let conversation_view = panel.update(cx, |panel, cx| {
+                    panel.resume_center_thread(
+                        agent,
+                        thread_id,
+                        Some(work_dirs),
+                        title,
+                        window,
+                        cx,
+                    )
+                });
+                cx.new(|cx| Self::new(conversation_view, Some(workspace_id), cx))
+            })
+        })
+    }
+}
+
+/// Persists which thread a center-pane item is showing.
+struct CenterThreadDb(ThreadSafeConnection);
+
+impl Domain for CenterThreadDb {
+    const NAME: &str = stringify!(CenterThreadDb);
+
+    const MIGRATIONS: &[&str] = &[
+        sql!(
+            CREATE TABLE center_agent_threads (
+                workspace_id INTEGER,
+                item_id INTEGER,
+                thread_id BLOB,
+                PRIMARY KEY (workspace_id, item_id),
+                FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id)
+                ON DELETE CASCADE
+            ) STRICT;
+        ),
+    ];
+}
+
+db::static_connection!(CenterThreadDb, [workspace::WorkspaceDb]);
+
+impl CenterThreadDb {
+    async fn save_thread_id(
+        &self,
+        item_id: workspace::ItemId,
+        workspace_id: WorkspaceId,
+        thread_id: ThreadId,
+    ) -> Result<()> {
+        self.write(move |conn| {
+            let sql = "INSERT INTO center_agent_threads (workspace_id, item_id, thread_id) \
+                       VALUES (?1, ?2, ?3) \
+                       ON CONFLICT (workspace_id, item_id) DO UPDATE SET thread_id = excluded.thread_id";
+            let mut statement = Statement::prepare(conn, sql)?;
+            let next_index = statement.bind(&workspace_id, 1)?;
+            let next_index = statement.bind(&item_id, next_index)?;
+            statement.bind(&thread_id, next_index)?;
+            statement.exec()
+        })
+        .await
+    }
+
+    query! {
+        fn thread_id(item_id: workspace::ItemId, workspace_id: WorkspaceId) -> Result<Option<ThreadId>> {
+            SELECT thread_id
+            FROM center_agent_threads
+            WHERE item_id = ? AND workspace_id = ?
+        }
     }
 }
