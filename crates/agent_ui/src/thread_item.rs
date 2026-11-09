@@ -36,6 +36,7 @@ use workspace::{
 /// A workspace item that hosts an agent conversation in a center pane.
 pub struct ThreadItem {
     conversation_view: Entity<ConversationView>,
+    panel: Entity<AgentPanel>,
     workspace: WeakEntity<Workspace>,
     workspace_id: Option<WorkspaceId>,
     focus_handle: FocusHandle,
@@ -45,17 +46,45 @@ pub struct ThreadItem {
 impl ThreadItem {
     pub fn new(
         conversation_view: Entity<ConversationView>,
+        panel: Entity<AgentPanel>,
         workspace: WeakEntity<Workspace>,
         workspace_id: Option<WorkspaceId>,
         cx: &mut Context<Self>,
     ) -> Self {
         Self {
             conversation_view,
+            panel,
             workspace,
             workspace_id,
             focus_handle: cx.focus_handle(),
             needs_serialize: true,
         }
+    }
+
+    /// Creates a second center thread for the same agent, used when the user
+    /// splits the pane.
+    ///
+    /// Cloning the existing `ConversationView` is not an option: two views
+    /// sharing one thread id would both drive the same ACP session. A fresh
+    /// conversation gives the same agent in a parallel session instead.
+    fn spawn_sibling_thread(
+        &self,
+        agent: Agent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<Self> {
+        let conversation_view = self
+            .panel
+            .update(cx, |panel, cx| panel.create_center_thread(agent, window, cx));
+        cx.new(|cx| {
+            Self::new(
+                conversation_view,
+                self.panel.clone(),
+                self.workspace.clone(),
+                self.workspace_id,
+                cx,
+            )
+        })
     }
 
     /// Opens a new agent thread as a tab in the current pane.
@@ -82,7 +111,8 @@ impl ThreadItem {
 
         let workspace_id = workspace.database_id();
         let weak_workspace = workspace.weak_handle();
-        let item = cx.new(|cx| Self::new(conversation_view, weak_workspace, workspace_id, cx));
+        let item =
+            cx.new(|cx| Self::new(conversation_view, panel, weak_workspace, workspace_id, cx));
         workspace.add_item_to_active_pane(Box::new(item), None, true, window, cx);
     }
 }
@@ -165,31 +195,19 @@ impl Item for ThreadItem {
 
     fn clone_on_split(
         &self,
-        workspace_id: Option<WorkspaceId>,
+        _workspace_id: Option<WorkspaceId>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Task<Option<Entity<Self>>>
     where
         Self: Sized,
     {
-        // Splitting an agent thread starts a fresh conversation with the same
-        // agent rather than mirroring the existing one: two views sharing one
-        // thread id would fight over the same ACP session.
+        // Runs inside `Workspace::update`, so anything that leases the
+        // workspace panics. `self.panel` is a plain entity handle, which keeps
+        // this path free of workspace access.
         let agent = self.conversation_view.read(cx).agent_key().clone();
-        let workspace = self.workspace.clone();
-        let panel = workspace
-            .clone()
-            .upgrade()
-            .and_then(|workspace| workspace.read(cx).panel::<AgentPanel>(cx));
-        cx.spawn_in(window, async move |_this, cx| {
-            let panel = panel?;
-            cx.update(|window, cx| {
-                let conversation_view =
-                    panel.update(cx, |panel, cx| panel.create_center_thread(agent, window, cx));
-                cx.new(|cx| Self::new(conversation_view, workspace, workspace_id, cx))
-            })
-            .ok()
-        })
+        let item = self.spawn_sibling_thread(agent, window, cx);
+        Task::ready(Some(item))
     }
 
     fn show_toolbar(&self) -> bool {
@@ -282,7 +300,15 @@ impl SerializableItem for ThreadItem {
                         cx,
                     )
                 });
-                cx.new(|cx| Self::new(conversation_view, workspace, Some(workspace_id), cx))
+                cx.new(|cx| {
+                    Self::new(
+                        conversation_view,
+                        panel,
+                        workspace,
+                        Some(workspace_id),
+                        cx,
+                    )
+                })
             })
         })
     }
