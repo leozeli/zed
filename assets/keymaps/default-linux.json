@@ -1364,6 +1364,15 @@
     },
   },
   {
+    "context": "Workspace",
+    "use_key_equivalents": true,
+    "bindings": {
+      // Opens an agent conversation as a regular tab in the center pane, next
+      // to the "New Center Terminal" action.
+      "ctrl-alt-shift-t": "agent::NewCenterThread",
+    },
+  },
+  {
     "context": "AgentPanel > Terminal",
     "use_key_equivalents": true,
     "bindings": {

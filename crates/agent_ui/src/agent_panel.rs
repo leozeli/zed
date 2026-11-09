@@ -45,8 +45,8 @@ use crate::terminal_thread_metadata_store::{
 };
 use crate::thread_metadata_store::{ThreadId, ThreadMetadataStore, ThreadMetadataStoreEvent};
 use crate::{
-    Agent, AgentInitialContent, AgentThreadSource, ExternalSourcePrompt, NewExternalAgentThread,
-    NewNativeAgentThreadFromSummary,
+    Agent, AgentInitialContent, AgentThreadSource, ExternalSourcePrompt, NewCenterThread,
+    NewExternalAgentThread, NewNativeAgentThreadFromSummary,
 };
 use crate::{
     AgentDiffPane, ConversationView, CopyThreadToClipboard, Follow, LoadThreadFromClipboard,
@@ -370,6 +370,9 @@ pub fn init(cx: &mut App) {
                         });
                         workspace.focus_panel::<AgentPanel>(window, cx);
                     }
+                })
+                .register_action(|workspace, action: &NewCenterThread, window, cx| {
+                    crate::ThreadItem::deploy(workspace, action, window, cx);
                 })
                 .register_action(|workspace, _: &NewTerminalThread, window, cx| {
                     if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
@@ -4618,6 +4621,37 @@ impl AgentPanel {
             window,
             cx,
         )
+    }
+
+    /// Creates an agent thread that is owned by a center pane item rather than
+    /// by this panel.
+    ///
+    /// The conversation view is built through the same code path as a panel
+    /// thread, so it keeps its thread metadata, sidebar entry, and
+    /// notifications. The difference is that the returned view is not installed
+    /// as the panel's base view: the caller wraps it in a workspace [`Item`]
+    /// and adds it to a pane.
+    ///
+    /// [`Item`]: workspace::Item
+    pub(crate) fn create_center_thread(
+        &mut self,
+        agent: Agent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<ConversationView> {
+        self.create_agent_thread_with_server(
+            agent,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            AgentThreadSource::CenterPane,
+            window,
+            cx,
+        )
+        .conversation_view
     }
 
     /// Legacy entry that resumes a thread by raw ACP session id when no

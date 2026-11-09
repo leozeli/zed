@@ -31,6 +31,7 @@ pub mod terminal_thread_metadata_store;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 mod thread_import;
+pub mod thread_item;
 pub mod thread_metadata_store;
 pub mod thread_worktree_archive;
 
@@ -94,6 +95,7 @@ pub use thread_import::{
     AcpThreadImportOnboarding, CrossChannelImportOnboarding, ThreadImportModal,
     channels_with_threads, import_threads_from_other_channels,
 };
+pub use thread_item::ThreadItem;
 use zed_actions;
 pub use zed_actions::{CreateWorktree, NewWorktreeBranchTarget, SwitchWorktree};
 
@@ -270,6 +272,7 @@ const PARALLEL_AGENT_LAYOUT_BACKFILL_KEY: &str = "parallel_agent_layout_backfill
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AgentThreadSource {
     AgentPanel,
+    CenterPane,
     GitPanel,
     Sidebar,
 }
@@ -278,6 +281,7 @@ impl AgentThreadSource {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::AgentPanel => "agent_panel",
+            Self::CenterPane => "center_pane",
             Self::GitPanel => "git_panel",
             Self::Sidebar => "sidebar",
         }
@@ -478,6 +482,20 @@ pub struct ToggleCommandPattern {
 #[serde(deny_unknown_fields)]
 pub struct NewThread;
 
+/// Opens a new agent thread as a tab in the center pane.
+///
+/// Unlike [`NewThread`], which binds the thread to the Agent Panel, this opens
+/// the conversation as a regular workspace item so it can sit beside editors,
+/// be split, and be moved between panes.
+#[derive(Default, Clone, PartialEq, Deserialize, JsonSchema, Action)]
+#[action(namespace = agent)]
+#[serde(deny_unknown_fields)]
+pub struct NewCenterThread {
+    /// The agent to use. Defaults to the agent panel's currently selected agent.
+    #[serde(default, deserialize_with = "deserialize_optional_external_agent_id")]
+    pub agent: Option<AgentId>,
+}
+
 /// Creates a new external agent conversation thread.
 #[derive(Clone, PartialEq, Deserialize, JsonSchema, Action)]
 #[action(namespace = agent)]
@@ -506,6 +524,32 @@ where
         #[cfg(any(test, feature = "test-support"))]
         AgentIdOrLegacyAgent::LegacyAgent(Agent::Stub) => Ok(Agent::Stub.id()),
     }
+}
+
+fn deserialize_optional_external_agent_id<'de, D>(
+    deserializer: D,
+) -> Result<Option<AgentId>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum MaybeAgentId {
+        AgentId(AgentId),
+        LegacyAgent(Agent),
+    }
+
+    let Some(maybe) = Option::<MaybeAgentId>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+
+    Ok(Some(match maybe {
+        MaybeAgentId::AgentId(agent_id) => agent_id,
+        MaybeAgentId::LegacyAgent(Agent::Custom { id }) => id,
+        MaybeAgentId::LegacyAgent(Agent::NativeAgent) => Agent::NativeAgent.id(),
+        #[cfg(any(test, feature = "test-support"))]
+        MaybeAgentId::LegacyAgent(Agent::Stub) => Agent::Stub.id(),
+    }))
 }
 
 #[derive(Clone, PartialEq, Deserialize, JsonSchema, Action)]
